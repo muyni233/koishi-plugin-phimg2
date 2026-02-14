@@ -1,6 +1,6 @@
 import { Context, Schema, h } from 'koishi'
 
-export const name = 'phimg'
+export const name = 'phimg2'
 export const inject = ['database', 'http']
 
 declare module 'koishi' {
@@ -27,6 +27,7 @@ export interface Config {
   enabledByDefault: boolean
   useGlobalTagsByDefault: boolean
   filterId: number
+  showErrorLog: boolean
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -36,6 +37,7 @@ export const Config: Schema<Config> = Schema.object({
   enabledByDefault: Schema.boolean().description('新群聊默认启用搜图功能').default(true),
   useGlobalTagsByDefault: Schema.boolean().description('新群聊默认启用全局标签').default(true),
   filterId: Schema.number().description('搜索使用的 Filter ID (例如 100073)').default(100073),
+  showErrorLog: Schema.boolean().description('是否在控制台输出搜图失败的日志').default(false),
 })
 
 interface GroupConfig {
@@ -102,7 +104,13 @@ export function apply(ctx: Context, config: Config) {
           headers: { 'User-Agent': 'Phimg for Koishi' }
         })
       } else {
-        responseData = await ctx.http.post(endpoint, params, {
+        const formBody = new URLSearchParams()
+        for (const key in params) {
+          if (params[key] !== undefined && params[key] !== null) {
+            formBody.append(key, String(params[key]))
+          }
+        }
+        responseData = await ctx.http.post(endpoint, formBody, {
           params: queryParams,
           headers: {
             'User-Agent': 'Phimg for Koishi',
@@ -117,9 +125,11 @@ export function apply(ctx: Context, config: Config) {
 
       return responseData
     } catch (error) {
+      if (config.showErrorLog) {
+        ctx.logger('phimg').warn(`API Error: ${error.message}`)
+      }
       if (error.response?.status === 404) throw new Error('未找到匹配的图片')
-      ctx.logger('phimg').warn(error)
-      throw new Error(`API 请求失败: ${error.message}`)
+      throw new Error(error.message || 'API 请求失败')
     }
   }
 
@@ -127,38 +137,36 @@ export function apply(ctx: Context, config: Config) {
 
   const getMediaElement = (selected: any) => {
     if (!selected?.representations) return h.text('图片数据解析错误')
-    
     const file = selected.representations.full
     const url = file.endsWith('.webm') ? selected.representations.medium : selected.representations.large
     const fileType = file.split('.').pop()?.toLowerCase() || ''
-    
-    if (VIDEO_TYPES.includes(fileType)) {
-      return h.video(url)
-    }
+    if (VIDEO_TYPES.includes(fileType)) return h.video(url)
     return h.image(url)
   }
 
   const searchHelp = `用法: /搜图 [tags|distance]
 
+用法说明:
+  引用图片: 进行以图搜图 (默认距离 0.25)
+  直接发图: 发送指令时附带图片进行以图搜图
+  输入文本: 进行标签搜索
+
 可选项:
   --tags             获取当前群聊内置标签列表
   --status           获取当前群聊的搜图功能状态
-  --pp [per_page]    每页结果数量，默认为50
-  --p [page]         页码，默认为1
-  --sf [sf]          排序字段，默认为score
-  --sd [sd]          排序方向，默认为desc
-  --i [index]        选择结果索引，默认为-1（即随机）
+  --pp [num]         每页数量 (默认50)
+  --p [num]          页码 (默认1)
+  --sf [field]       排序字段 (默认score)
+  --sd [desc|asc]    排序方向 (默认desc)
+  --i [index]        选择结果索引 (默认随机)`
 
-提示: 
-  图搜图使用方式为引用图片，默认匹配距离为0.25`
-
-  const configHelp = `用法: 搜图-c [选项]
+  const configHelp = `用法: /搜图-c [选项]
 
 可选项:
-  --add [tags]       添加标签，多个标签用逗号分隔
-  --rm [tags]        删除标签，多个标签用逗号分隔
-  --on               开启当前群聊的搜图功能
-  --off              关闭当前群聊的搜图功能
+  --add [tags]       添加标签
+  --rm [tags]        删除标签
+  --on               开启搜图
+  --off              关闭搜图
   --onglobal         启用全局标签
   --offglobal        关闭全局标签`
 
@@ -173,11 +181,10 @@ export function apply(ctx: Context, config: Config) {
     .action(async ({ session, options }, ...paramsArray) => {
       if (!session?.guildId) return '搜图仅限群聊使用。'
 
-      let params = paramsArray.join(' ').trim()
-
-      if (!params && !session.quote && !options.tags && !options.status) {
-        return searchHelp
-      }
+      const rawParams = paramsArray.join(' ')
+      // 更新帮助逻辑：如果没参数、没引用、当前消息也没图片、没选项，则显示帮助
+      const hasImageInContent = !!(h.select(session.content, 'image')[0] || h.select(session.content, 'img')[0])
+      if (!rawParams && !session.quote && !hasImageInContent && !options.tags && !options.status) return searchHelp
       
       const groupId = session.guildId
       const groupConfig = await getGroupConfig(groupId)
@@ -185,28 +192,23 @@ export function apply(ctx: Context, config: Config) {
       if (options.status) {
         return `当前群聊搜图功能状态：\n启用：${groupConfig.enabled}\n标签：${groupConfig.customTags.join(', ') || '无'}\n全局标签：${groupConfig.useGlobalTags ? '启用' : '禁用'}`
       }
-
       if (options.tags) {
         return `当前群聊内置标签：${groupConfig.customTags.join(', ') || '无'}`
       }
-
       if (!groupConfig.enabled) {
         return '搜图未在本群开启，管理员请用 "搜图-c --on" 启动'
       }
 
-      params = translateText(params || '')
+      const paramsText = translateText(rawParams || '')
+      const cleanParams = paramsText.replace(/<[^>]+>/g, '').trim()
       
-      // 关键修改：清理参数中的非文本元素（例如 <at>, <image> 等）
-      // OneBot 引用回复时常会携带 at 标签或空图片标签，导致 Number() 判定为 NaN
-      const cleanParams = params.replace(/<[^>]+>/g, '').trim()
-
       let imageUrl: string | undefined
-      // 优先检查引用消息中的图片
+      // 1. 优先检查引用消息中的图片
       if (session.quote) {
         const img = h.select(session.quote.content, 'image')[0] || h.select(session.quote.content, 'img')[0]
         if (img) imageUrl = img.attrs.url || img.attrs.src
       }
-      // 如果引用没找到，尝试在当前消息中找图片（兼容 OneBot 直接发图+指令）
+      // 2. 如果引用没图片，检查当前指令消息中是否附带了图片
       if (!imageUrl) {
         const img = h.select(session.content, 'image')[0] || h.select(session.content, 'img')[0]
         if (img) imageUrl = img.attrs.url || img.attrs.src
@@ -215,7 +217,6 @@ export function apply(ctx: Context, config: Config) {
       try {
         if (imageUrl) {
           let distance = 0.25
-          // 使用清理后的 cleanParams 进行判断
           if (cleanParams) {
             const parsed = Number(cleanParams)
             if (!isNaN(parsed)) {
@@ -234,26 +235,23 @@ export function apply(ctx: Context, config: Config) {
           const data = await makeRequest('reverse', queryParams)
           const images = data.images
           
-          if (images.length > 10) {
-            return `搜索到过多图片 (${images.length} 张)，请尝试减小距离参数。`
-          }
+          if (images.length > 10) return `搜索到过多图片 (${images.length} 张)，请尝试减小距离参数。`
           if (images.length === 0) return '未找到匹配的图片'
 
           const result = [h('at', { id: session.userId }), h.text(`\ndistance: ${distance}\n`)]
-          
           for (const img of images) {
             result.push(getMediaElement(img))
-            result.push(h.text(`\nid: ${img.id} | score: ${img.score}\n`))
+            result.push(h.text(`\ nid: ${img.id} | score: ${img.score}\n`))
           }
           return result
+
         } else {
-          // 文本搜图逻辑
-          const userTags = cleanParams ? cleanParams.split(',').map(t => t.trim()).filter(t => t) : []
+          const userTags = cleanParams ? cleanParams.split(/[,，]/).map(t => t.trim()).filter(t => t) : []
           const globalTags = groupConfig.useGlobalTags ? config.defaultTags : []
           const groupTags = groupConfig.customTags
           const allTags = Array.from(new Set([...groupTags, ...globalTags, ...userTags]))
 
-          if (allTags.length === 0 && !cleanParams) return '请输入搜索标签。'
+          if (allTags.length === 0) return '请输入搜索标签。'
 
           const queryParams: any = {
             q: allTags.join(', '),
@@ -290,7 +288,6 @@ export function apply(ctx: Context, config: Config) {
 
   const confirmOffGlobal = new Set<string>()
 
-  // 配置命令保持不变
   ctx.command('搜图-c', '配置搜图功能', { authority: 3 })
     .option('on', '--on')
     .option('off', '--off')
@@ -335,7 +332,6 @@ export function apply(ctx: Context, config: Config) {
 
       if (options.add || options.rm) {
         let newTags = [...groupConfig.customTags]
-        
         if (options.add) {
           const tagsToAdd = translateText(options.add).split(/[,，]/).map(t => t.trim()).filter(t => t)
           newTags = [...new Set([...newTags, ...tagsToAdd])]
@@ -344,7 +340,6 @@ export function apply(ctx: Context, config: Config) {
           const tagsToRm = translateText(options.rm).split(/[,，]/).map(t => t.trim()).filter(t => t)
           newTags = newTags.filter(t => !tagsToRm.includes(t))
         }
-
         await updateGroupConfig(groupId, { customTags: newTags })
         response += `修改成功，本群标签现为: ${newTags.join(', ') || '无'}\n`
       }
