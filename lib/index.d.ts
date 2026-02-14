@@ -1,4 +1,5 @@
 import { Context, Schema } from 'koishi';
+export declare const name = "phimg";
 export declare const inject: string[];
 declare module 'koishi' {
     interface Tables {
@@ -11,12 +12,11 @@ export interface Config {
     defaultTags: string[];
     enabledByDefault: boolean;
     useGlobalTagsByDefault: boolean;
-    proxy: string;
-    timeout: number;
+    filterId: number;
 }
 export declare const Config: Schema<Config>;
 interface GroupConfig {
-    id?: number;
+    id: number;
     groupId: string;
     enabled: boolean;
     useGlobalTags: boolean;
